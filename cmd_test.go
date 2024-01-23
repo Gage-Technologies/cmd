@@ -3,7 +3,6 @@
 package cmd_test
 
 import (
-	"bytes"
 	"errors"
 	"io/ioutil"
 	"os"
@@ -1281,33 +1280,89 @@ func TestCmdNoOutput(t *testing.T) {
 }
 
 func TestStdinOk(t *testing.T) {
+	lineContent := cmd.DEFAULT_LINE_BUFFER_SIZE * 2
+	longLine := make([]byte, lineContent) // "AAA..."
+	for i := 0; i < lineContent; i++ {
+		longLine[i] = 'A'
+	}
+
+	tmpfile, err := ioutil.TempFile("", "cmd.TestStdinOk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		os.Remove(tmpfile.Name())
+	})
+	if _, err := tmpfile.Write(longLine); err != nil {
+		t.Fatal(err)
+	}
+	if err := tmpfile.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	tests := []struct {
-		in []byte
+		in   []byte
+		bin  string
+		args []string
+		out  []string
+		err  []string
 	}{
 		{
-			in: []byte("1"),
+			in:   []byte("1"),
+			bin:  "test/stdin",
+			args: []string{},
+			out:  []string{"stdin: 1"},
+			err:  []string{},
 		},
 		{
-			in: []byte("hello"),
+			in:   []byte("hello"),
+			bin:  "test/stdin",
+			args: []string{},
+			out:  []string{"stdin: hello"},
+			err:  []string{},
 		},
 		{
-			in: []byte{65, 66, 67, 226, 130, 172}, // ABC€
+			in:   []byte{65, 66, 67, 226, 130, 172}, // ABC€
+			bin:  "test/stdin",
+			args: []string{},
+			out:  []string{"stdin: ABC€"},
+			err:  []string{},
+		},
+		{
+			in:   nil,
+			bin:  "test/cat",
+			args: []string{tmpfile.Name(), "2"},
+			out:  []string{},
+			err:  []string{string(longLine)},
 		},
 	}
 	for _, tt := range tests {
 		now := time.Now().Unix()
-		p := cmd.NewCmd("test/stdin")
-		gotStatus := <-p.StartWithStdin(bytes.NewReader(tt.in))
+		p := cmd.NewCmdOptions(cmd.Options{
+			Buffered:       true,
+			LineBufferSize: cmd.DEFAULT_LINE_BUFFER_SIZE * 2,
+		}, tt.bin, tt.args...)
+		statusChan, stdin := p.StartWithStdin()
+		if stdin == nil {
+			t.Fatalf("expected Stdin, got nil")
+		}
+		if tt.in != nil {
+			go func() {
+				stdin.Write(tt.in)
+			}()
+			time.Sleep(time.Millisecond * 100)
+			stdin.Close()
+		}
+		gotStatus := <-statusChan
 		expectStatus := cmd.Status{
-			Cmd:      "test/stdin",
+			Cmd:      tt.bin,
 			PID:      gotStatus.PID, // nondeterministic
 			Complete: true,
 			Exit:     0,
 			Error:    nil,
 			Runtime:  gotStatus.Runtime, // nondeterministic
-			Stdout:   []string{"stdin: " + string(tt.in)},
-			Stderr:   []string{},
+			Stdout:   tt.out,
+			Stderr:   tt.err,
 		}
 		if gotStatus.StartTs < now {
 			t.Error("StartTs < now")

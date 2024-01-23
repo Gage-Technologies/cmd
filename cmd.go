@@ -269,21 +269,21 @@ func (c *Cmd) Clone() *Cmd {
 // is not closed. Any Go error is set to Status.Error. Start is idempotent; it
 // always returns the same channel.
 func (c *Cmd) Start() <-chan Status {
-	return c.StartWithStdin(nil)
+	statusChan, _ := c.StartWithStdin()
+	return statusChan
 }
 
 // StartWithStdin is the same as Start but uses in for STDIN.
-func (c *Cmd) StartWithStdin(in io.Reader) <-chan Status {
+func (c *Cmd) StartWithStdin() (<-chan Status, io.WriteCloser) {
 	c.Lock()
 	defer c.Unlock()
 
 	if c.statusChan != nil {
-		return c.statusChan
+		return c.statusChan, nil
 	}
 
 	c.statusChan = make(chan Status, 1)
-	go c.run(in)
-	return c.statusChan
+	return c.statusChan, c.run()
 }
 
 // SendSignal sends the given signal to its process group if group is true,
@@ -405,64 +405,54 @@ func (c *Cmd) Done() <-chan struct{} {
 
 // --------------------------------------------------------------------------
 
-func (c *Cmd) run(in io.Reader) {
-	defer func() {
-		c.statusChan <- c.Status() // unblocks Start if caller is waiting
-		close(c.doneChan)
-	}()
-
+func (c *Cmd) run() io.WriteCloser {
 	// //////////////////////////////////////////////////////////////////////
 	// Setup command
 	// //////////////////////////////////////////////////////////////////////
-	cmd := exec.Command(c.Name, c.Args...)
-	if in != nil {
-		cmd.Stdin = in
+	exitFunc := func(err error) io.WriteCloser {
+		c.Lock()
+		c.status.Error = err
+		c.status.StartTs = 0
+		c.status.StopTs = 0
+		c.done = true
+		c.Unlock()
+
+		c.statusChan <- c.Status() // unblocks Start if caller is waiting
+		close(c.doneChan)
+		return nil
 	}
 
-	// Platform-specific SysProcAttr management
-	setProcessGroupID(cmd)
+	cmd := exec.Command(c.Name, c.Args...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return exitFunc(err)
+	}
 
 	// Set exec.Cmd.Stdout and .Stderr to our concurrent-safe stdout/stderr
 	// buffer, stream both, or neither
 	switch {
+		case c.stdoutBuf != nil && c.stderrBuf != nil && c.stdoutStream != nil: // buffer and stream
+			cmd.Stdout = io.MultiWriter(c.stdoutStream, c.stdoutBuf)
+			cmd.Stderr = io.MultiWriter(c.stderrStream, c.stderrBuf)
+		case c.stdoutBuf != nil && c.stderrBuf == nil && c.stdoutStream != nil: // combined buffer and stream
+			cmd.Stdout = io.MultiWriter(c.stdoutStream, c.stdoutBuf)
+			cmd.Stderr = io.MultiWriter(c.stderrStream, c.stdoutBuf)
+		case c.stdoutBuf != nil && c.stderrBuf != nil: // buffer only
+			cmd.Stdout = c.stdoutBuf
+			cmd.Stderr = c.stderrBuf
+		case c.stdoutBuf != nil && c.stderrBuf == nil: // buffer combining stderr into stdout
+			cmd.Stdout = c.stdoutBuf
+			cmd.Stderr = c.stdoutBuf
+		case c.stdoutStream != nil: // stream only
+			cmd.Stdout = c.stdoutStream
+			cmd.Stderr = c.stderrStream
+		default: // no output (cmd >/dev/null 2>&1)
+			cmd.Stdout = nil
+			cmd.Stderr = nil
+		}
 
-	case c.stdoutBuf != nil && c.stderrBuf != nil && c.stdoutStream != nil: // buffer and stream
-		cmd.Stdout = io.MultiWriter(c.stdoutStream, c.stdoutBuf)
-		cmd.Stderr = io.MultiWriter(c.stderrStream, c.stderrBuf)
-	case c.stdoutBuf != nil && c.stderrBuf == nil && c.stdoutStream != nil: // combined buffer and stream
-		cmd.Stdout = io.MultiWriter(c.stdoutStream, c.stdoutBuf)
-		cmd.Stderr = io.MultiWriter(c.stderrStream, c.stdoutBuf)
-	case c.stdoutBuf != nil && c.stderrBuf != nil: // buffer only
-		cmd.Stdout = c.stdoutBuf
-		cmd.Stderr = c.stderrBuf
-	case c.stdoutBuf != nil && c.stderrBuf == nil: // buffer combining stderr into stdout
-		cmd.Stdout = c.stdoutBuf
-		cmd.Stderr = c.stdoutBuf
-	case c.stdoutStream != nil: // stream only
-		cmd.Stdout = c.stdoutStream
-		cmd.Stderr = c.stderrStream
-	default: // no output (cmd >/dev/null 2>&1)
-		cmd.Stdout = nil
-		cmd.Stderr = nil
-	}
-
-	// Always close output streams. Do not do this after Wait because if Start
-	// fails and we return without closing these, it could deadlock the caller
-	// who's waiting for us to close them.
-	if c.stdoutStream != nil {
-		defer func() {
-			c.stdoutStream.Flush()
-			c.stderrStream.Flush()
-			// exec.Cmd.Wait has already waited for all output:
-			//   Otherwise, during the execution of the command a separate goroutine
-			//   reads from the process over a pipe and delivers that data to the
-			//   corresponding Writer. In this case, Wait does not complete until the
-			//   goroutine reaches EOF or encounters an error.
-			// from https://golang.org/pkg/os/exec/#Cmd
-			close(c.Stdout)
-			close(c.Stderr)
-		}()
-	}
+	// Platform-specific SysProcAttr management
+	setProcessGroupID(cmd)
 
 	// Set the runtime environment for the command as per os/exec.Cmd.  If Env
 	// is nil, use the current process' environment.
@@ -474,70 +464,97 @@ func (c *Cmd) run(in io.Reader) {
 		f(cmd)
 	}
 
-	// //////////////////////////////////////////////////////////////////////
-	// Start command
-	// //////////////////////////////////////////////////////////////////////
-	now := time.Now()
-	if err := cmd.Start(); err != nil {
+	go func() {
+		defer func() {
+			c.statusChan <- c.Status() // unblocks Start if caller is waiting
+			close(c.doneChan)
+		}()
+
+		// Always close output streams. Do not do this after Wait because if Start
+		// fails and we return without closing these, it could deadlock the caller
+		// who's waiting for us to close them.
+		if c.stdoutStream != nil {
+			defer func() {
+				c.stdoutStream.Flush()
+				c.stderrStream.Flush()
+				// exec.Cmd.Wait has already waited for all output:
+				//   Otherwise, during the execution of the command a separate goroutine
+				//   reads from the process over a pipe and delivers that data to the
+				//   corresponding Writer. In this case, Wait does not complete until the
+				//   goroutine reaches EOF or encounters an error.
+				// from https://golang.org/pkg/os/exec/#Cmd
+				close(c.Stdout)
+				close(c.Stderr)
+			}()
+		}
+
+		// //////////////////////////////////////////////////////////////////////
+		// Start command
+		// //////////////////////////////////////////////////////////////////////
+		now := time.Now()
+		if err := cmd.Start(); err != nil {
+			c.Lock()
+			c.status.Error = err
+			c.status.StartTs = now.UnixNano()
+			c.status.StopTs = time.Now().UnixNano()
+			c.done = true
+			c.Unlock()
+			return
+		}
+
+		// Set initial status
 		c.Lock()
-		c.status.Error = err
+		c.startTime = now              // command is running
+		c.status.PID = cmd.Process.Pid // command is running
 		c.status.StartTs = now.UnixNano()
-		c.status.StopTs = time.Now().UnixNano()
-		c.done = true
+		c.started = true
 		c.Unlock()
-		return
-	}
 
-	// Set initial status
-	c.Lock()
-	c.startTime = now              // command is running
-	c.status.PID = cmd.Process.Pid // command is running
-	c.status.StartTs = now.UnixNano()
-	c.started = true
-	c.Unlock()
+		// //////////////////////////////////////////////////////////////////////
+		// Wait for command to finish or be killed
+		// //////////////////////////////////////////////////////////////////////
+		err := cmd.Wait()
+		now = time.Now()
 
-	// //////////////////////////////////////////////////////////////////////
-	// Wait for command to finish or be killed
-	// //////////////////////////////////////////////////////////////////////
-	err := cmd.Wait()
-	now = time.Now()
-
-	// Get exit code of the command. According to the manual, Wait() returns:
-	// "If the command fails to run or doesn't complete successfully, the error
-	// is of type *ExitError. Other error types may be returned for I/O problems."
-	exitCode := 0
-	signaled := false
-	if err != nil && fmt.Sprintf("%T", err) == "*exec.ExitError" {
-		// This is the normal case which is not really an error. It's string
-		// representation is only "*exec.ExitError". It only means the cmd
-		// did not exit zero and caller should see ExitError.Stderr, which
-		// we already have. So first we'll have this as the real/underlying
-		// type, then discard err so status.Error doesn't contain a useless
-		// "*exec.ExitError". With the real type we can get the non-zero
-		// exit code and determine if the process was signaled, which yields
-		// a more specific error message, so we set err again in that case.
-		exiterr := err.(*exec.ExitError)
-		err = nil
-		if waitStatus, ok := exiterr.Sys().(syscall.WaitStatus); ok {
-			exitCode = waitStatus.ExitStatus() // -1 if signaled
-			if waitStatus.Signaled() {
-				signaled = true
-				err = errors.New(exiterr.Error()) // "signal: terminated"
+		// Get exit code of the command. According to the manual, Wait() returns:
+		// "If the command fails to run or doesn't complete successfully, the error
+		// is of type *ExitError. Other error types may be returned for I/O problems."
+		exitCode := 0
+		signaled := false
+		if err != nil && fmt.Sprintf("%T", err) == "*exec.ExitError" {
+			// This is the normal case which is not really an error. It's string
+			// representation is only "*exec.ExitError". It only means the cmd
+			// did not exit zero and caller should see ExitError.Stderr, which
+			// we already have. So first we'll have this as the real/underlying
+			// type, then discard err so status.Error doesn't contain a useless
+			// "*exec.ExitError". With the real type we can get the non-zero
+			// exit code and determine if the process was signaled, which yields
+			// a more specific error message, so we set err again in that case.
+			exiterr := err.(*exec.ExitError)
+			err = nil
+			if waitStatus, ok := exiterr.Sys().(syscall.WaitStatus); ok {
+				exitCode = waitStatus.ExitStatus() // -1 if signaled
+				if waitStatus.Signaled() {
+					signaled = true
+					err = errors.New(exiterr.Error()) // "signal: terminated"
+				}
 			}
 		}
-	}
 
-	// Set final status
-	c.Lock()
-	if !c.stopped && !signaled {
-		c.status.Complete = true
-	}
-	c.status.Runtime = now.Sub(c.startTime).Seconds()
-	c.status.StopTs = now.UnixNano()
-	c.status.Exit = exitCode
-	c.status.Error = err
-	c.done = true
-	c.Unlock()
+		// Set final status
+		c.Lock()
+		if !c.stopped && !signaled {
+			c.status.Complete = true
+		}
+		c.status.Runtime = now.Sub(c.startTime).Seconds()
+		c.status.StopTs = now.UnixNano()
+		c.status.Exit = exitCode
+		c.status.Error = err
+		c.done = true
+		c.Unlock()
+	}()
+
+	return stdin
 }
 
 // //////////////////////////////////////////////////////////////////////////
