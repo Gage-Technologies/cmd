@@ -160,6 +160,11 @@ type Options struct {
 	// with CombinedOutput.
 	Streaming bool
 
+	// Enables byte level streaming directly to the caller. This will return raw data
+	// chunks through the streams with no regard for lines. This is only compatible
+	// when Streaming is also true and Buffered is false.
+	DirectStreaming bool
+
 	// BeforeExec is a list of functions called immediately before starting
 	// the real command. These functions can be used to customize the underlying
 	// os/exec.Cmd. For example, to set SysProcAttr.
@@ -206,11 +211,11 @@ func NewCmdOptions(options Options, name string, args ...string) *Cmd {
 
 	if options.Streaming {
 		c.Stdout = make(chan string, DEFAULT_STREAM_CHAN_SIZE)
-		c.stdoutStream = NewOutputStream(c.Stdout)
+		c.stdoutStream = NewOutputStream(c.Stdout, options.DirectStreaming && !options.Buffered)
 		c.stdoutStream.SetLineBufferSize(int(options.LineBufferSize))
 
 		c.Stderr = make(chan string, DEFAULT_STREAM_CHAN_SIZE)
-		c.stderrStream = NewOutputStream(c.Stderr)
+		c.stderrStream = NewOutputStream(c.Stderr, options.DirectStreaming && !options.Buffered)
 		c.stderrStream.SetLineBufferSize(int(options.LineBufferSize))
 	}
 
@@ -431,25 +436,25 @@ func (c *Cmd) run() io.WriteCloser {
 	// Set exec.Cmd.Stdout and .Stderr to our concurrent-safe stdout/stderr
 	// buffer, stream both, or neither
 	switch {
-		case c.stdoutBuf != nil && c.stderrBuf != nil && c.stdoutStream != nil: // buffer and stream
-			cmd.Stdout = io.MultiWriter(c.stdoutStream, c.stdoutBuf)
-			cmd.Stderr = io.MultiWriter(c.stderrStream, c.stderrBuf)
-		case c.stdoutBuf != nil && c.stderrBuf == nil && c.stdoutStream != nil: // combined buffer and stream
-			cmd.Stdout = io.MultiWriter(c.stdoutStream, c.stdoutBuf)
-			cmd.Stderr = io.MultiWriter(c.stderrStream, c.stdoutBuf)
-		case c.stdoutBuf != nil && c.stderrBuf != nil: // buffer only
-			cmd.Stdout = c.stdoutBuf
-			cmd.Stderr = c.stderrBuf
-		case c.stdoutBuf != nil && c.stderrBuf == nil: // buffer combining stderr into stdout
-			cmd.Stdout = c.stdoutBuf
-			cmd.Stderr = c.stdoutBuf
-		case c.stdoutStream != nil: // stream only
-			cmd.Stdout = c.stdoutStream
-			cmd.Stderr = c.stderrStream
-		default: // no output (cmd >/dev/null 2>&1)
-			cmd.Stdout = nil
-			cmd.Stderr = nil
-		}
+	case c.stdoutBuf != nil && c.stderrBuf != nil && c.stdoutStream != nil: // buffer and stream
+		cmd.Stdout = io.MultiWriter(c.stdoutStream, c.stdoutBuf)
+		cmd.Stderr = io.MultiWriter(c.stderrStream, c.stderrBuf)
+	case c.stdoutBuf != nil && c.stderrBuf == nil && c.stdoutStream != nil: // combined buffer and stream
+		cmd.Stdout = io.MultiWriter(c.stdoutStream, c.stdoutBuf)
+		cmd.Stderr = io.MultiWriter(c.stderrStream, c.stdoutBuf)
+	case c.stdoutBuf != nil && c.stderrBuf != nil: // buffer only
+		cmd.Stdout = c.stdoutBuf
+		cmd.Stderr = c.stderrBuf
+	case c.stdoutBuf != nil && c.stderrBuf == nil: // buffer combining stderr into stdout
+		cmd.Stdout = c.stdoutBuf
+		cmd.Stderr = c.stdoutBuf
+	case c.stdoutStream != nil: // stream only
+		cmd.Stdout = c.stdoutStream
+		cmd.Stderr = c.stderrStream
+	default: // no output (cmd >/dev/null 2>&1)
+		cmd.Stdout = nil
+		cmd.Stderr = nil
+	}
 
 	// Platform-specific SysProcAttr management
 	setProcessGroupID(cmd)
@@ -688,22 +693,24 @@ func (e ErrLineBufferOverflow) Error() string {
 // While runnableCmd is running, lines are sent to the channel as soon as they
 // are written and newline-terminated by the command.
 type OutputStream struct {
-	streamChan chan string
-	bufSize    int
-	buf        []byte
-	lastChar   int
+	streamChan      chan string
+	bufSize         int
+	buf             []byte
+	lastChar        int
+	directStreaming bool
 }
 
 // NewOutputStream creates a new streaming output on the given channel. The
 // caller must begin receiving on the channel before the command is started.
 // The OutputStream never closes the channel.
-func NewOutputStream(streamChan chan string) *OutputStream {
+func NewOutputStream(streamChan chan string, directStreaming bool) *OutputStream {
 	out := &OutputStream{
 		streamChan: streamChan,
 		// --
-		bufSize:  DEFAULT_LINE_BUFFER_SIZE,
-		buf:      make([]byte, DEFAULT_LINE_BUFFER_SIZE),
-		lastChar: 0,
+		bufSize:         DEFAULT_LINE_BUFFER_SIZE,
+		buf:             make([]byte, DEFAULT_LINE_BUFFER_SIZE),
+		lastChar:        0,
+		directStreaming: directStreaming,
 	}
 	return out
 }
@@ -713,6 +720,12 @@ func NewOutputStream(streamChan chan string) *OutputStream {
 func (rw *OutputStream) Write(p []byte) (n int, err error) {
 	n = len(p) // end of buffer
 	firstChar := 0
+
+	// if we have direct streaming enabled then we just write the content directly to the channel
+	if rw.directStreaming {
+		rw.streamChan <- string(p[:])
+		return
+	}
 
 	for {
 		// Find next newline in stream buffer. nextLine starts at 0, but buff

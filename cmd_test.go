@@ -749,9 +749,62 @@ func TestCmdOnlyStreamingOutput(t *testing.T) {
 	}
 }
 
+func TestDirectStreaming(t *testing.T) {
+	chunks := make(chan string, 5)
+	out := cmd.NewOutputStream(chunks, true)
+
+	// Quick side test: Lines() chan string should be the same chan string
+	// we created the object with
+	if out.Lines() != chunks {
+		t.Errorf("Lines() does not return the given string chan")
+	}
+
+	// Write two short lines
+	input1 := "1\n2\n"
+	input2 := "3\n4"
+	n, err := out.Write([]byte(input1))
+	if n != len(input1) {
+		t.Errorf("Write n = %d, expected %d", n, len(input1))
+	}
+	if err != nil {
+		t.Errorf("got err '%v', expected nil", err)
+	}
+	n, err = out.Write([]byte(input2))
+	if n != len(input2) {
+		t.Errorf("Write n = %d, expected %d", n, len(input2))
+	}
+	if err != nil {
+		t.Errorf("got err '%v', expected nil", err)
+	}
+
+	// Get one line
+	var gotChunk string
+	select {
+	case gotChunk = <-chunks:
+	default:
+		t.Fatal("blocked on <-chunks")
+	}
+
+	// "foo" should be sent before "bar" because that was the input
+	if gotChunk !=  input1 {
+		t.Errorf("got line: '%s', expected 'foo'", gotChunk)
+	}
+
+	// Get next line
+	select {
+	case gotChunk = <-chunks:
+	default:
+		t.Fatal("blocked on <-chunks")
+	}
+
+	if gotChunk != input2 {
+		t.Errorf("got line: '%s', expected 'bar'", gotChunk)
+	}
+}
+
 func TestStreamingMultipleLines(t *testing.T) {
 	lines := make(chan string, 5)
-	out := cmd.NewOutputStream(lines)
+	out := cmd.NewOutputStream(lines, false)
 
 	// Quick side test: Lines() chan string should be the same chan string
 	// we created the object with
@@ -798,7 +851,7 @@ func TestStreamingMultipleLinesLastNotTerminated(t *testing.T) {
 	// If last line isn't \n terminated, go-cmd should flush it anyway
 	// https://github.com/go-cmd/cmd/pull/48
 	lines := make(chan string, 5)
-	out := cmd.NewOutputStream(lines)
+	out := cmd.NewOutputStream(lines, false)
 
 	// Quick side test: Lines() chan string should be the same chan string
 	// we created the object with
@@ -845,7 +898,7 @@ func TestStreamingMultipleLinesLastNotTerminated(t *testing.T) {
 
 func TestStreamingBlankLines(t *testing.T) {
 	lines := make(chan string, 5)
-	out := cmd.NewOutputStream(lines)
+	out := cmd.NewOutputStream(lines, false)
 
 	// Blank line in the middle
 	input := "foo\n\nbar\n"
@@ -923,7 +976,7 @@ LINES3:
 func TestStreamingCarriageReturn(t *testing.T) {
 	// Carriage return should be stripped
 	lines := make(chan string, 5)
-	out := cmd.NewOutputStream(lines)
+	out := cmd.NewOutputStream(lines, false)
 
 	input := "foo\r\nbar\r\n"
 	expectLines := []string{"foo", "bar"}
@@ -954,7 +1007,7 @@ func TestStreamingLineBuffering(t *testing.T) {
 	// write. When line is later terminated with newline, we prepend the buffered
 	// line and send the complete line.
 	lines := make(chan string, 1)
-	out := cmd.NewOutputStream(lines)
+	out := cmd.NewOutputStream(lines, false)
 
 	// Write 3 unterminated lines. Without a newline, they'll be buffered until...
 	for i := 0; i < 3; i++ {
@@ -1017,7 +1070,7 @@ func TestStreamingErrLineBufferOverflow1(t *testing.T) {
 	longLine[cmd.DEFAULT_LINE_BUFFER_SIZE+1] = 'z'
 
 	lines := make(chan string, 5)
-	out := cmd.NewOutputStream(lines)
+	out := cmd.NewOutputStream(lines, false)
 
 	// Write the long line, it should only write (n) 3 bytes for "bc\n"
 	n, err := out.Write(longLine)
@@ -1078,7 +1131,7 @@ func TestStreamingErrLineBufferOverflow2(t *testing.T) {
 	// Overflow line buffer on 2nd write. So first write puts something in the
 	// buffer, and then 2nd overflows it instead of completing the line.
 	lines := make(chan string, 1)
-	out := cmd.NewOutputStream(lines)
+	out := cmd.NewOutputStream(lines, false)
 
 	// Get "bar" into the buffer by omitting its newline
 	input := "foo\nbar"
@@ -1142,7 +1195,7 @@ func TestStreamingSetLineBufferSize(t *testing.T) {
 	longLine[cmd.DEFAULT_LINE_BUFFER_SIZE+1] = '\n'
 
 	lines := make(chan string, 5)
-	out := cmd.NewOutputStream(lines)
+	out := cmd.NewOutputStream(lines, false)
 	out.SetLineBufferSize(cmd.DEFAULT_LINE_BUFFER_SIZE * 2)
 
 	n, err := out.Write(longLine)
